@@ -241,6 +241,19 @@ class SolrTestCase(unittest.TestCase):
         resp_3 = RubbishResponse('<html><body><pre>Something is broke.</pre></body></html>', {'server': 'jetty'})
         self.assertEqual(self.solr._extract_error(resp_3), "[Reason: Something is broke.]")
 
+        resp_4 = RubbishResponse('''
+            <response>
+                <lst name="responseHeader">
+                    <int name="status">400</int>
+                    <int name="QTime">6</int>
+                </lst>
+                <lst name="error">
+                    <str name="msg">Document is missing mandatory uniqueKey field: id</str>
+                    <int name="code">400</int>
+                </lst>
+            </response>''', {'content-type': 'application/xml; charset=UTF-8'})
+        self.assertEqual(self.solr._extract_error(resp_4), "[Reason: Document is missing mandatory uniqueKey field: id]")
+
     def test__scrape_response(self):
         # Tomcat.
         resp_1 = self.solr._scrape_response({'server': 'coyote'}, '<html><body><p><span>Error message</span><span>messed up.</span></p></body></html>')
@@ -337,11 +350,49 @@ class SolrTestCase(unittest.TestCase):
             'title': 'Example doc ☃ 1',
             'price': 12.59,
             'popularity': 10,
+            'cat': {'set': ['Classics', 'Mystery', 'Science Fiction']},
+            'sub_cat': {'add': ['General', 'Fantasy']},
+            'features': ['strategise', 'bandwidth', 'milestone'],
+            'weight': {'inc': 11},
         }
-        doc_xml = force_unicode(ET.tostring(self.solr._build_doc(doc), encoding='utf-8'))
-        self.assertTrue('<field name="title">Example doc ☃ 1</field>' in doc_xml)
-        self.assertTrue('<field name="id">doc_1</field>' in doc_xml)
-        self.assertEqual(len(doc_xml), 152)
+        result = self.solr._build_doc(doc)
+        self.assertEqual(result.tag, 'doc')
+        elements = result.findall('./field[@name="id"]')
+        self.assertEqual(len(elements), 1)
+        self.assertEqual(elements[0].text, 'doc_1')
+        elements = result.findall('./field[@name="title"]')
+        self.assertEqual(len(elements), 1)
+        self.assertEqual(elements[0].text, 'Example doc ☃ 1')
+        elements = result.findall('./field[@name="price"]')
+        self.assertEqual(len(elements), 1)
+        self.assertEqual(elements[0].text, '12.59')
+        elements = result.findall('./field[@name="popularity"]')
+        self.assertEqual(len(elements), 1)
+        self.assertEqual(elements[0].text, '10')
+        elements = result.findall('./field[@name="features"]')
+        self.assertEqual(len(elements), 3)
+        self.assertEqual(elements[0].text, 'strategise')
+        self.assertEqual(elements[1].text, 'bandwidth')
+        self.assertEqual(elements[2].text, 'milestone')
+        elements = result.findall('./field[@name="cat"]')
+        self.assertEqual(len(elements), 3)
+        self.assertEqual(elements[0].text, 'Classics')
+        self.assertEqual(elements[0].get('update'), 'set')
+        self.assertEqual(elements[1].text, 'Mystery')
+        self.assertEqual(elements[1].get('update'), 'set')
+        self.assertEqual(elements[2].text, 'Science Fiction')
+        self.assertEqual(elements[2].get('update'), 'set')
+        elements = result.findall('./field[@name="sub_cat"]')
+        self.assertEqual(len(elements), 2)
+        self.assertEqual(elements[0].text, 'General')
+        self.assertEqual(elements[0].get('update'), 'add')
+        self.assertEqual(elements[1].text, 'Fantasy')
+        self.assertEqual(elements[1].get('update'), 'add')
+        elements = result.findall('./field[@name="weight"]')
+        self.assertEqual(len(elements), 1)
+        self.assertEqual(elements[0].get('update'), 'inc')
+        self.assertEqual(elements[0].text, '11')
+#         doc_xml = force_unicode(ET.tostring(result, encoding='utf-8'))
 
     def test_add(self):
         self.assertEqual(len(self.solr.search('doc')), 3)
@@ -448,8 +499,62 @@ class SolrTestCase(unittest.TestCase):
         self.assertEqual(['Test Title ☃☃'], m['title'])
 
     def test_full_url(self):
-        self.solr.url = 'http://localhost:8983/solr/'
+        self.solr.url = 'http://localhost:8983/solr/core0/'
         full_url = self.solr._create_full_url(path='/update')
 
         # Make sure trailing and leading slashes do not collide:
-        self.assertEqual(full_url, 'http://localhost:8983/solr/update')
+        self.assertEqual(full_url, 'http://localhost:8983/solr/core0/update')
+
+
+class EscapeTestCase(unittest.TestCase):
+    def setUp(self):
+        super(EscapeTestCase, self).setUp()
+        self.default_solr = Solr('http://localhost:8983/solr/core0')
+        # Short timeouts.
+        self.solr = Solr('http://localhost:8983/solr/core0', timeout=2)
+
+        # Clear it.
+        self.solr.delete(q='*:*')
+
+        self.docs = [
+            {'id': 'space', 'content_type': 'witch in space'},
+            {'id': 'plus', 'content_type': 'witch+mob=justice'},
+            {'id': 'minus', 'content_type': 'politician-integrity=politician'},
+            {'id': 'and', 'content_type': 'arthur&&knightsoftheroundtable'},
+            {'id': 'or', 'content_type': 'parrot||dead'},
+            {'id': 'not', 'content_type': 'thatis!deadwhichcaneternallie'},
+            {'id': 'parenthesis', 'content_type': 'parrot(live)'},
+            {'id': 'brace', 'content_type': 'rabbit{killer}'},
+            {'id': 'bracket', 'content_type': 'walks[silly]'},
+            {'id': 'caret', 'content_type': 'a^b'},
+            {'id': 'tilde',
+             'content_type': 'answertolifetheuniverseandeverything~=42'},
+            {'id': 'asterisk', 'content_type': '*andobelisk'},
+            {'id': 'question_mark',
+             'content_type': 'anafricanoreuropeanswallow?'},
+            {'id': 'colon', 'content_type': '2:0'},
+            {'id': 'backslash', 'content_type': r'a\c'}]
+
+        self.solr.add(self.docs)
+
+    def tearDown(self):
+        self.solr.delete(q='*:*')
+        super(EscapeTestCase, self).tearDown()
+
+    def test_escape_term(self):
+        for doc in self.docs:
+            query = 'content_type:{content_type}'.format(
+                content_type=self.solr.escape_term(doc['content_type']))
+            result = self.solr.search(query)
+            self.assertEqual(result.hits, 1, (doc['id'], query))
+            self.assertEqual(result.docs[0]['id'], doc['id'],
+                             (doc['id'], query))
+
+    def test_escape_phrase(self):
+        for doc in self.docs:
+            query = 'content_type:"{content_type}"'.format(
+                content_type=self.solr.escape_phrase(doc['content_type']))
+            result = self.solr.search(query)
+            self.assertEqual(result.hits, 1, (doc['id'], query))
+            self.assertEqual(result.docs[0]['id'], doc['id'],
+                             (doc['id'], query))

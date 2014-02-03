@@ -250,6 +250,20 @@ class Solr(object):
         solr = pysolr.Solr('http://localhost:8983/solr', timeout=10)
 
     """
+
+    LUCENE_SPECIAL_CHARACTERS_REGEX = re.compile(r'[-+&|!(){}\[\]^"~*?:\\]')
+    LUCENE_WHITESPACE_REGEXP = re.compile(r'\s')
+
+    @classmethod
+    def escape_term(cls, string):
+        return cls.LUCENE_WHITESPACE_REGEXP.sub(
+            r'\\\g<0>',
+            cls.LUCENE_SPECIAL_CHARACTERS_REGEX.sub(r'\\\g<0>', string))
+
+    @classmethod
+    def escape_phrase(cls, string):
+        return cls.LUCENE_SPECIAL_CHARACTERS_REGEX.sub(r'\\\g<0>', string)
+
     def __init__(self, url, decoder=None, timeout=60):
         self.decoder = decoder or json.JSONDecoder()
         self.url = url
@@ -295,11 +309,10 @@ class Solr(object):
             # encoded to bytes to work properly on Py3.
             bytes_body = body
 
-            if bytes_body is not None:
+            if isinstance(bytes_body, str if IS_PY3 else basestring):
                 bytes_body = force_bytes(body)
-
-            if not 'content-type' in [key.lower() for key in headers.keys()]:
-                headers['Content-type'] = 'application/xml; charset=UTF-8'
+                if not 'content-type' in [key.lower() for key in headers.keys()]:
+                    headers['Content-type'] = 'application/xml; charset=UTF-8'
 
             resp = requests_method(url, data=bytes_body, headers=headers, files=files,
                                    timeout=self.timeout)
@@ -408,7 +421,7 @@ class Solr(object):
 
     def _scrape_response(self, headers, response):
         """
-        Scrape the html response.
+        Scrape the html or xml response.
         """
         # identify the responding server
         server_type = None
@@ -453,8 +466,11 @@ class Solr(object):
                 dom_tree = ET.fromstring(response)
                 reason_node = None
 
+                # XML response
+                if 'application/xml' in headers.get('content-type', ''):
+                    reason_node = dom_tree.find('lst[@name="error"]/str[@name="msg"]')
                 # html page might be different for every server
-                if server_type == 'jetty':
+                elif server_type == 'jetty':
                     reason_node = dom_tree.find('body/pre')
                 else:
                     reason_node = dom_tree.find('head/title')
@@ -710,13 +726,28 @@ class Solr(object):
                 doc_elem.set('boost', force_unicode(value))
                 continue
 
-            # To avoid multiple code-paths we'd like to treat all of our values as iterables:
-            if isinstance(value, (list, tuple)):
-                values = value
+            # To aviod multiple code paths we'll treat all values as
+            # dictionaries with attributes and value keys:
+            entry = {'attributes': {},
+                     'values': None}
+            if isinstance(value, dict):
+                if frozenset(['attributes', 'values']).issuperset(
+                        frozenset(value.keys())):
+                    entry = value
+                else:
+                    for (attribute, attrib_value) in value.items():
+                        if attribute in set(['inc', 'set', 'add']):
+                            entry['attributes']['update'] = attribute
+                            entry['values'] = attrib_value
             else:
-                values = (value, )
+                entry['values'] = value
 
-            for bit in values:
+            # To avoid multiple code-paths we'd like to treat all of our
+            # values as iterables:
+            if not isinstance(entry['values'], (list, tuple)):
+                entry['values'] = (entry['values'], )
+
+            for bit in entry['values']:
                 if self._is_null_value(bit):
                     continue
 
@@ -724,6 +755,8 @@ class Solr(object):
 
                 if boost and key in boost:
                     attrs['boost'] = force_unicode(boost[key])
+
+                attrs.update(entry['attributes'])
 
                 field = ET.Element('field', **attrs)
                 field.text = self._from_python(bit)
